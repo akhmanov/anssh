@@ -2,14 +2,12 @@
 
 Simple SSH CLI for Ansible inventory (`hosts.yml`).
 
-`anssh` reads host settings from inventory and runs:
+`anssh` reads host settings from inventory (via `ansible-inventory --list`) and runs:
 
 - SSH connect
 - Local tunnel with auto-reconnect
 - Remote command execution
 - Host listing
-
-No `ansible-inventory` binary required.
 
 ## Installation
 
@@ -21,6 +19,7 @@ go install github.com/akhmanov/anssh/cmd/anssh@latest
 
 - Go 1.25+
 - `ssh` available in `PATH`
+- `ansible-inventory` available in `PATH`
 - Ansible-style inventory YAML (`hosts.yml`)
 
 ## Inventory source
@@ -32,6 +31,17 @@ Set inventory via:
 
 If both are set, `--inventory` is used.
 
+Optional command override:
+
+- `ANSSH_ANSIBLE_INVENTORY_CMD` (default: `ansible-inventory`)
+
+Examples:
+
+```bash
+ANSSH_ANSIBLE_INVENTORY_CMD="ansible-inventory --playbook-dir /path/to/repo" anssh -i ./inventory/hosts.yml list
+ANSSH_ANSIBLE_INVENTORY_CMD="/opt/homebrew/bin/ansible-inventory" anssh doctor
+```
+
 ## Usage
 
 ```bash
@@ -39,6 +49,7 @@ anssh [global options] <target> [ssh args...]
 anssh [global options] tunnel <target> <local:remote>
 anssh [global options] exec <target> <command>
 anssh [global options] list
+anssh [global options] doctor
 ```
 
 ### Global options
@@ -64,6 +75,9 @@ anssh -i ./inventory/hosts.yml exec prod-app-1 "docker ps"
 
 # List hosts from inventory
 anssh -i ./inventory/hosts.yml list
+
+# Check required binaries in PATH
+anssh doctor
 ```
 
 ## Supported host fields

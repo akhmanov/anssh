@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,20 +16,15 @@ import (
 
 	"github.com/google/shlex"
 	"github.com/urfave/cli/v2"
-	"gopkg.in/yaml.v3"
 )
 
-type inventoryFile struct {
-	All group `yaml:"all"`
+type inventoryList struct {
+	Meta inventoryMeta `json:"_meta"`
 }
 
-type group struct {
-	Vars     map[string]any       `yaml:"vars"`
-	Hosts    map[string]hostEntry `yaml:"hosts"`
-	Children map[string]group     `yaml:"children"`
+type inventoryMeta struct {
+	Hostvars map[string]map[string]any `json:"hostvars"`
 }
-
-type hostEntry map[string]any
 
 type hostConfig struct {
 	Name       string
@@ -36,6 +32,12 @@ type hostConfig struct {
 	User       string
 	KeyFile    string
 	CommonArgs string
+}
+
+type commandSpec struct {
+	Raw  string
+	Bin  string
+	Args []string
 }
 
 func main() {
@@ -68,6 +70,11 @@ func main() {
 				Name:   "list",
 				Usage:  "List hosts from inventory",
 				Action: runList,
+			},
+			{
+				Name:   "doctor",
+				Usage:  "Check required binaries in PATH",
+				Action: runDoctor,
 			},
 		},
 	}
@@ -224,59 +231,103 @@ func runList(c *cli.Context) error {
 	return tw.Flush()
 }
 
+func runDoctor(c *cli.Context) error {
+	ansibleCmd, err := ansibleInventoryCommand()
+	if err != nil {
+		return cli.Exit(err.Error(), 2)
+	}
+
+	checks := []commandSpec{
+		{Raw: "ssh", Bin: "ssh"},
+		ansibleCmd,
+	}
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "COMMAND\tSTATUS\tPATH")
+
+	hasMissing := false
+	for _, check := range checks {
+		path, err := exec.LookPath(check.Bin)
+		if err != nil {
+			hasMissing = true
+			fmt.Fprintf(tw, "%s\tmissing\t-\n", check.Raw)
+			continue
+		}
+		fmt.Fprintf(tw, "%s\tok\t%s\n", check.Raw, path)
+	}
+
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	if hasMissing {
+		return cli.Exit("doctor failed: install missing binaries", 1)
+	}
+
+	return nil
+}
+
 func loadHosts(inventoryPath string) (map[string]hostConfig, error) {
 	path := strings.TrimSpace(inventoryPath)
 	if path == "" {
 		return nil, cli.Exit("inventory is required: pass --inventory or set ANSSH_INVENTORY", 2)
 	}
 
-	raw, err := os.ReadFile(path)
+	ansibleCmd, err := ansibleInventoryCommand()
 	if err != nil {
-		return nil, fmt.Errorf("read inventory %q: %w", path, err)
+		return nil, cli.Exit(err.Error(), 2)
 	}
 
-	var inv inventoryFile
-	if err := yaml.Unmarshal(raw, &inv); err != nil {
-		return nil, fmt.Errorf("parse inventory %q: %w", path, err)
+	args := append([]string{}, ansibleCmd.Args...)
+	args = append(args, "-i", path, "--list")
+
+	cmd := exec.Command(ansibleCmd.Bin, args...)
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, cli.Exit(fmt.Sprintf("%s binary not found in PATH", ansibleCmd.Bin), 127)
+		}
+
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			msg := strings.TrimSpace(string(raw))
+			if msg == "" {
+				msg = exitErr.Error()
+			}
+			return nil, cli.Exit(fmt.Sprintf("%s failed: %s", ansibleCmd.Raw, msg), exitErr.ExitCode())
+		}
+
+		return nil, fmt.Errorf("run %s: %w", ansibleCmd.Raw, err)
 	}
 
-	hosts := map[string]hostConfig{}
-	walkGroup(inv.All, map[string]string{}, hosts)
+	var inv inventoryList
+	if err := json.Unmarshal(raw, &inv); err != nil {
+		return nil, fmt.Errorf("parse ansible-inventory output: %w", err)
+	}
+
+	hosts := make(map[string]hostConfig, len(inv.Meta.Hostvars))
+	for name, vars := range inv.Meta.Hostvars {
+		hosts[name] = hostFromVars(name, toStringMap(vars))
+	}
+
 	return hosts, nil
 }
 
-func walkGroup(g group, inherited map[string]string, hosts map[string]hostConfig) {
-	mergedVars := mergeVars(inherited, toStringMap(g.Vars))
-
-	hostNames := make([]string, 0, len(g.Hosts))
-	for name := range g.Hosts {
-		hostNames = append(hostNames, name)
-	}
-	sort.Strings(hostNames)
-
-	for _, name := range hostNames {
-		hv := toStringMap(g.Hosts[name])
-		allVars := mergeVars(mergedVars, hv)
-
-		existing, ok := hosts[name]
-		candidate := hostFromVars(name, allVars)
-
-		if ok {
-			hosts[name] = mergeHost(existing, candidate)
-			continue
-		}
-		hosts[name] = candidate
+func ansibleInventoryCommand() (commandSpec, error) {
+	raw := strings.TrimSpace(os.Getenv("ANSSH_ANSIBLE_INVENTORY_CMD"))
+	if raw == "" {
+		return commandSpec{Raw: "ansible-inventory", Bin: "ansible-inventory"}, nil
 	}
 
-	childNames := make([]string, 0, len(g.Children))
-	for name := range g.Children {
-		childNames = append(childNames, name)
+	parts, err := shlex.Split(raw)
+	if err != nil {
+		return commandSpec{}, fmt.Errorf("parse ANSSH_ANSIBLE_INVENTORY_CMD: %w", err)
 	}
-	sort.Strings(childNames)
+	if len(parts) == 0 {
+		return commandSpec{}, fmt.Errorf("ANSSH_ANSIBLE_INVENTORY_CMD is empty")
+	}
 
-	for _, child := range childNames {
-		walkGroup(g.Children[child], mergedVars, hosts)
-	}
+	return commandSpec{Raw: raw, Bin: parts[0], Args: parts[1:]}, nil
 }
 
 func hostFromVars(name string, vars map[string]string) hostConfig {
@@ -291,34 +342,6 @@ func hostFromVars(name string, vars map[string]string) hostConfig {
 		KeyFile:    strings.TrimSpace(vars["ansible_ssh_private_key_file"]),
 		CommonArgs: strings.TrimSpace(vars["ansible_ssh_common_args"]),
 	}
-}
-
-func mergeHost(base, extra hostConfig) hostConfig {
-	out := base
-	if out.Host == "" && extra.Host != "" {
-		out.Host = extra.Host
-	}
-	if out.User == "" && extra.User != "" {
-		out.User = extra.User
-	}
-	if out.KeyFile == "" && extra.KeyFile != "" {
-		out.KeyFile = extra.KeyFile
-	}
-	if out.CommonArgs == "" && extra.CommonArgs != "" {
-		out.CommonArgs = extra.CommonArgs
-	}
-	return out
-}
-
-func mergeVars(base, extra map[string]string) map[string]string {
-	out := make(map[string]string, len(base)+len(extra))
-	for k, v := range base {
-		out[k] = v
-	}
-	for k, v := range extra {
-		out[k] = v
-	}
-	return out
 }
 
 func toStringMap(input map[string]any) map[string]string {
