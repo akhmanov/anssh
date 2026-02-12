@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +41,8 @@ type commandSpec struct {
 	Bin  string
 	Args []string
 }
+
+var inventoryDirTemplatePattern = regexp.MustCompile(`\{\{\s*inventory_dir\s*\}\}`)
 
 func main() {
 	app := &cli.App{
@@ -307,7 +311,7 @@ func loadHosts(inventoryPath string) (map[string]hostConfig, error) {
 
 	hosts := make(map[string]hostConfig, len(inv.Meta.Hostvars))
 	for name, vars := range inv.Meta.Hostvars {
-		hosts[name] = hostFromVars(name, toStringMap(vars))
+		hosts[name] = hostFromVars(name, expandKnownTemplates(toStringMap(vars), path))
 	}
 
 	return hosts, nil
@@ -328,6 +332,21 @@ func ansibleInventoryCommand() (commandSpec, error) {
 	}
 
 	return commandSpec{Raw: raw, Bin: parts[0], Args: parts[1:]}, nil
+}
+
+func expandKnownTemplates(vars map[string]string, inventoryPath string) map[string]string {
+	out := make(map[string]string, len(vars))
+
+	inventoryDir := filepath.Dir(inventoryPath)
+	if absDir, err := filepath.Abs(inventoryDir); err == nil {
+		inventoryDir = absDir
+	}
+
+	for k, v := range vars {
+		out[k] = inventoryDirTemplatePattern.ReplaceAllString(v, inventoryDir)
+	}
+
+	return out
 }
 
 func hostFromVars(name string, vars map[string]string) hostConfig {
